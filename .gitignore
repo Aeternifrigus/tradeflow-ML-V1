@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+mlruns/
+*.egg-info/
+
+# Generated data & artifacts (regenerate via pipeline, don't commit)
+data/raw_shipments.csv
+artifacts/*.parquet
+models/*.joblib
+models/*.json
+
+# Secrets
+.env
+*.pem
+terraform/*.tfstate*
+terraform/.terraform/

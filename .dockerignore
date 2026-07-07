@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+mlruns/
+artifacts/*.parquet
+.git/
+.github/
+terraform/
+tests/
+*.md
+.env
