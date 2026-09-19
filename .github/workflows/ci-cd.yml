@@ -30,10 +30,11 @@ jobs:
       - name: Lint (ruff)
         run: ruff check src tests data
 
-      - name: Generate synthetic data + run ETL (needed for tests)
+      - name: Run the pipeline end to end (generate, ETL, train)
         run: |
           python -m data.generate_synthetic_data
           python -m src.pipeline.etl
+          python -m src.models.train
 
       - name: Run tests
         run: pytest -v --maxfail=1

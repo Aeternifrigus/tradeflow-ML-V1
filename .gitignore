@@ -9,9 +9,11 @@ mlruns/
 
 # Generated data & artifacts (regenerate via pipeline, don't commit)
 data/raw_shipments.csv
+data/market_history.csv
 artifacts/*.parquet
 models/*.joblib
 models/*.json
+models/*.parquet
 
 # Secrets
 .env
