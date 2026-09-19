@@ -1,9 +1,26 @@
 # TradeFlow-ML
 
-End-to-end MLOps pipeline that predicts **landed cost** for India → Poland
-FCL shipments (Mundra/Nhava Sheva → Gdynia/Gdansk), and uses an LLM agent to
-extract structured fields from raw trade documents (commercial invoices,
-packing lists).
+End-to-end MLOps pipeline that forecasts **landed cost at booking time** for
+India → Poland FCL shipments (Mundra/Nhava Sheva/Chennai → Gdynia/Gdansk), and
+uses an LLM to extract structured fields from raw trade documents (commercial
+invoices, packing lists).
+
+## The problem
+
+When a trader books a container, they know the goods, the route and the
+forwarder's freight quote. The landed cost is only settled weeks later, and it
+rarely matches the quote:
+
+- carriers pass freight market increases between booking and departure on as
+  rate increases (and pass decreases on only in part)
+- the bunker (fuel) surcharge is set at departure
+- delays beyond the free days cost demurrage, and delays cluster in peak
+  season and during supply disruptions
+- customs clears at the USD/PLN rate on arrival day, not booking day
+
+The model forecasts the landed cost using only what is known on booking day,
+and is judged against the estimate a trader would work out by hand from the
+quote.
 
 The model and data are grounded in a real trade lane (organic spices,
 psyllium husk, lentils, hotel textiles) rather than a generic Kaggle dataset
@@ -16,14 +33,14 @@ serving → CI/CD → cloud deployment via IaC.
 ```mermaid
 flowchart LR
     subgraph Data
-        A[Raw shipment records\nCSV] --> B[ETL\nvalidate + clean]
-        B --> C[(Parquet\nclean_shipments)]
+        A[Shipments CSV\n+ daily market history] --> B[ETL\nvalidate + clean]
+        B --> C[(Parquet\nshipments + market)]
     end
 
     subgraph Training
-        C --> D[Feature engineering\ncalendar + rolling FX/freight]
-        D --> E[XGBoost training\nMLflow tracked]
-        E --> F[(model.joblib +\nfeature schema)]
+        C --> D[Point-in-time features\nmarket state as of booking]
+        D --> E[XGBoost, time split\nvs quote baseline\nMLflow tracked]
+        E --> F[(model + schema\n+ market history)]
     end
 
     subgraph Serving
@@ -49,14 +66,15 @@ flowchart LR
 
 | Layer | Location | Purpose |
 |---|---|---|
-| Data generation | `data/generate_synthetic_data.py` | Synthetic shipment records shaped like real freight/FX/customs data. Swap for a real warehouse/CSV source without touching downstream code. |
-| ETL | `src/pipeline/etl.py` | Load, validate, and quality-check raw records; writes a canonical Parquet dataset. Includes explicit data quality tests (nulls, range checks, duplicate rate). |
-| Feature engineering | `src/pipeline/features.py` | Calendar features, rolling FX/freight windows, one-hot encoding with frozen category schema (so training and inference never diverge in shape). |
-| Training | `src/models/train.py` | XGBoost regressor, MLflow experiment tracking (params, metrics, model artifact). |
-| Inference | `src/models/predict.py` | Loads the frozen model + schema; used by the API. Kept dependency-light (no MLflow/sklearn training deps) for a smaller serving image. |
-| Agentic parsing | `src/agent/document_parser.py` | Calls Claude to extract structured fields (HS code, Incoterm, value, quantity) from free-text trade documents; degrades to a regex parser if no API key is set, so it's testable offline/in CI. |
+| Data generation | `data/generate_synthetic_data.py` | Synthetic daily market history (freight index with seasonality and disruption regimes, USD/PLN, fuel) and shipments whose landed cost is realized at arrival. Swap for real records and a market data feed without touching downstream code. |
+| Cost rules | `src/pipeline/costs.py` | Insurance, CIF-based customs duty, bunker surcharge, demurrage and terminal charges, shared by the generator and the baseline. |
+| ETL | `src/pipeline/etl.py` | Loads and validates both datasets: required columns, value ranges, arrival after booking, and a gap-free daily market series. |
+| Feature engineering | `src/pipeline/features.py` | Point-in-time features: shipment facts plus market state *as of* the booking date (freight momentum, volatility, level vs its 6-month mean). Rows are independent, so training batches and single API requests get identical features. |
+| Training | `src/models/train.py` | Time-based split with a label-availability cutoff, XGBoost on the log ratio of realized cost to the quote estimate, two baselines, MLflow tracking. |
+| Inference | `src/models/predict.py` | Loads the model directory (model, schema, market history) and forecasts; rejects unknown categories and dates the market data cannot cover. |
+| Document parsing | `src/agent/document_parser.py` | Calls Claude with a forced tool call, so the answer is schema-shaped data; validates the fields, logs every fallback with its reason, and falls back to a regex parser without an API key. |
 | API | `src/api/main.py` | FastAPI service exposing `/predict`, `/parse-document`, `/health`. |
-| Tests | `tests/` | Unit tests for feature engineering and the parsing agent, plus an API integration test that trains a small model and hits the endpoints. |
+| Tests | `tests/` | Leakage tests (no look-ahead, outcome columns ignored, training labels known by the cutoff), batch vs single-request parity, a check that the model beats both baselines, parser failure paths, and API tests. |
 | CI/CD | `.github/workflows/ci-cd.yml` | Lint (ruff) → test (pytest) → train → build Docker image → push to Artifact Registry → deploy to Cloud Run → smoke test. |
 | IaC | `terraform/` | Artifact Registry repo, Cloud Storage bucket for artifacts, service account, Cloud Run service — all provisioned declaratively. |
 
@@ -66,7 +84,7 @@ flowchart LR
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 1. Generate data and run the pipeline
+# 1. Generate shipments + market history and run the pipeline
 python -m data.generate_synthetic_data
 python -m src.pipeline.etl
 
@@ -80,19 +98,46 @@ uvicorn src.api.main:app --reload
 pytest -v
 ```
 
-Example prediction request:
+Example forecast request, with only booking-day information:
 
 ```bash
 curl -X POST http://localhost:8000/predict \
   -H "Content-Type: application/json" \
   -d '{
-    "ship_date": "2026-07-01", "origin_port": "Mundra", "dest_port": "Gdynia",
+    "booking_date": "2026-06-20", "lead_time_days": 14,
+    "origin_port": "Mundra", "dest_port": "Gdynia",
     "commodity": "psyllium_husk", "container_type": "40ft_FCL",
-    "goods_value_usd": 26000, "freight_rate_usd": 2100, "fuel_index": 110,
-    "fx_usd_pln": 3.95, "fx_usd_inr": 83.1, "transit_days": 28,
-    "customs_duty_rate": 0.03, "insurance_usd": 104, "duty_usd": 780
+    "goods_value_usd": 48000, "customs_duty_rate": 0.03,
+    "planned_transit_days": 28, "freight_quote_usd": 4100
   }'
 ```
+
+The response gives the forecast, the quote-based estimate for comparison, and
+the date of the market data used. FX and fuel come from the market history
+saved with the model; a booking more than 7 days past its end is refused
+until the market data is refreshed.
+
+## Results
+
+On bookings made after the training cutoff (480 shipments, never seen in
+training), from `models/metrics.json`:
+
+| Estimate | MAE | MAPE | 90th percentile error |
+|---|---|---|---|
+| Quote-based estimate (what a trader calculates at booking) | 6,009 PLN | 3.5% | 14,003 PLN |
+| Same, plus the average historical overrun | 5,677 PLN | 3.3% | 11,996 PLN |
+| **Model** | **3,805 PLN** | **2.2%** | **8,357 PLN** |
+
+The model cuts the error by a third compared with the bias-corrected quote.
+Most of the gain comes from anticipating freight rate increases (market
+momentum, disruption regimes, peak season) and delay costs. Roughly a quarter
+of the remaining error is the USD/PLN move between booking and customs
+clearance, which no model can forecast reliably; the business answer to that
+is an FX forward, not a better model.
+
+These numbers come from synthetic data with known structure, so they show the
+pipeline works as intended, not how well it would do on a real book of
+shipments.
 
 ## Deploying to GCP
 
@@ -114,23 +159,39 @@ Required GitHub Actions secrets: `GCP_PROJECT_ID`,
 
 ## Design decisions worth calling out
 
+- **Point-in-time correctness**: every feature is computed from data available
+  on the booking date. The tests shock market prices after a date and check that
+  the features for that date do not change, and scramble the outcome columns
+  and check that the features do not change either.
+- **Label-availability cutoff**: a shipment's landed cost is only known after it
+  clears customs. Training uses only shipments that had arrived by the cutoff;
+  ones still at sea are left out of both sets.
+- **Predict the deviation, not the level**: the model learns the log ratio of
+  realized cost to the quote estimate. The arithmetic stays exact, and tree
+  models do not have to extrapolate price levels that drift upward over time.
+- **Always against a baseline**: a model that cannot beat a hand calculation
+  is not worth deploying, so every training run reports both baselines.
 - **Frozen category schema** (`categories.json`): one-hot encoding is fit once
   at training time and reused at inference, so a new commodity/route showing
   up in production can't silently produce a differently-shaped feature
-  matrix and crash or mis-predict.
+  matrix and crash or mis-predict. Unknown values are rejected with a 422.
 - **Agent with a fallback, not a hard dependency**: `/parse-document` works
   with or without an `ANTHROPIC_API_KEY`, which keeps CI deterministic and
   avoids paying for API calls on every test run.
 - **Thin API layer**: `src/api/main.py` has no business logic — it's a
   routing/validation layer over `src/models` and `src/agent`, so those
   modules are independently testable and reusable (e.g. from a batch job).
-- **Separate train-time vs serve-time dependencies**: `predict.py` avoids
-  importing `mlflow`/training-only libraries, keeping the production
-  container smaller and its attack surface narrower.
+- **Separate train-time vs serve-time code**: `predict.py` does not import
+  `mlflow` or training code. The image still installs the full
+  `requirements.txt`; a separate serving requirements file would be the next
+  step to shrink it.
 
 ## Possible extensions
 
-- Swap the synthetic data source for a real BigQuery/Iceberg table.
+- Swap the synthetic data for real shipment records and a daily market feed
+  (a freight index such as Drewry WCI, NBP exchange rates).
+- Prediction intervals (quantile regression), since a range is more useful
+  than a point estimate for pricing a contract.
 - Add a Vertex AI Pipelines version of the training DAG for scheduled
   retraining.
 - Add drift detection (e.g. compare live feature distributions against the

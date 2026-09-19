@@ -1,59 +1,92 @@
+import numpy as np
 import pandas as pd
 import pytest
 
-from src.pipeline.features import build_feature_matrix, add_calendar_features
+from src.pipeline.features import (
+    MAX_MARKET_STALENESS_DAYS,
+    MarketDataError,
+    build_features,
+    market_state,
+)
 
 
-@pytest.fixture
-def sample_df():
-    return pd.DataFrame({
-        "ship_date": pd.to_datetime(["2026-01-05", "2026-01-10", "2026-02-01"]),
-        "origin_port": ["Mundra", "Mundra", "Nhava_Sheva"],
-        "dest_port": ["Gdynia", "Gdynia", "Gdansk"],
-        "commodity": ["psyllium_husk", "lentils", "psyllium_husk"],
-        "container_type": ["40ft_FCL", "20ft_FCL", "40ft_FCL"],
-        "goods_value_usd": [26000.0, 19000.0, 27000.0],
-        "freight_rate_usd": [2100.0, 1950.0, 2200.0],
-        "fuel_index": [110.0, 108.0, 112.0],
-        "fx_usd_pln": [3.95, 3.97, 3.98],
-        "fx_usd_inr": [83.1, 83.2, 83.3],
-        "transit_days": [28.0, 27.5, 29.0],
-        "customs_duty_rate": [0.03, 0.0, 0.03],
-        "insurance_usd": [104.0, 76.0, 108.0],
-        "duty_usd": [780.0, 0.0, 810.0],
-        "landed_cost_pln": [115000.0, 84000.0, 118000.0],
-    })
+@pytest.fixture(scope="module")
+def state(dataset):
+    return market_state(dataset[1])
 
 
-def test_add_calendar_features_adds_expected_columns(sample_df):
-    out = add_calendar_features(sample_df)
-    assert {"ship_month", "ship_dayofweek", "ship_quarter"}.issubset(out.columns)
-    assert out.loc[0, "ship_month"] == 1
+def test_market_state_never_looks_ahead(dataset):
+    """Changing prices after a date must not change that date's features."""
+    _, market = dataset
+    day = market["date"].iloc[1500]
+    shocked = market.copy()
+    later = shocked["date"] > day
+    shocked.loc[later, ["freight_index_usd", "fx_usd_pln", "fuel_index"]] *= 3.0
+
+    before = market_state(market).loc[:day]
+    after = market_state(shocked).loc[:day]
+    pd.testing.assert_frame_equal(before, after)
 
 
-def test_build_feature_matrix_shapes(sample_df):
-    X, y, categories = build_feature_matrix(sample_df)
-    assert len(X) == len(sample_df)
-    assert y is not None and len(y) == len(sample_df)
-    # one-hot columns for every category value should exist
-    assert any(col.startswith("commodity_") for col in X.columns)
-    assert "origin_port" in categories
+def test_realized_outcome_columns_are_ignored(dataset, state):
+    shipments, _ = dataset
+    rows = shipments.iloc[:200]
+    scrambled = rows.copy()
+    for col in [c for c in rows.columns if c.startswith("realized_")]:
+        scrambled[col] = scrambled[col].sample(frac=1, random_state=0).to_numpy()
+
+    X1, _, _, cats = build_features(rows, state)
+    X2, _, _, _ = build_features(scrambled, state, cats)
+    pd.testing.assert_frame_equal(X1, X2)
 
 
-def test_build_feature_matrix_no_target_column_when_absent(sample_df):
-    df_no_target = sample_df.drop(columns=["landed_cost_pln"])
-    X, y, _ = build_feature_matrix(df_no_target)
+def test_single_row_features_equal_batch_features(dataset, state):
+    """Serving builds features one request at a time; they must match training."""
+    shipments, _ = dataset
+    rows = shipments.iloc[1000:1040]
+    X_batch, _, base_batch, cats = build_features(rows, state)
+    for i in range(len(rows)):
+        X_one, _, base_one, _ = build_features(rows.iloc[[i]], state, cats)
+        pd.testing.assert_series_equal(
+            X_one.iloc[0], X_batch.iloc[i], check_names=False
+        )
+        assert base_one.iloc[0] == pytest.approx(base_batch.iloc[i])
+
+
+def test_rows_keep_input_order(dataset, state):
+    shipments, _ = dataset
+    rows = shipments.iloc[:100].sample(frac=1, random_state=3)
+    X, y, baseline, _ = build_features(rows, state)
+    expected = np.log(rows["landed_cost_pln"].to_numpy() / baseline.to_numpy())
+    np.testing.assert_allclose(y.to_numpy(), expected)
+    np.testing.assert_allclose(X["log_goods_value_usd"], np.log(rows["goods_value_usd"]))
+
+
+def test_target_is_absent_at_inference(dataset, state):
+    shipments, _ = dataset
+    X, y, _, _ = build_features(shipments.iloc[:5].drop(columns=["landed_cost_pln"]), state)
     assert y is None
-    assert len(X) == len(df_no_target)
+    assert len(X) == 5
 
 
-def test_categories_alignment_for_unseen_inference_row(sample_df):
-    _, _, categories = build_feature_matrix(sample_df)
+def test_frozen_categories_give_the_same_columns(dataset, state):
+    shipments, _ = dataset
+    X_all, _, _, cats = build_features(shipments, state)
+    X_one, _, _, _ = build_features(shipments.iloc[[0]], state, cats)
+    assert list(X_one.columns) == list(X_all.columns)
 
-    new_row = sample_df.iloc[[0]].drop(columns=["landed_cost_pln"])
-    X_new, y_new, _ = build_feature_matrix(new_row, categories=categories)
 
-    assert y_new is None
-    # feature matrix built with frozen categories should have same dummy columns
-    # as one built from full training data (minus target-dependent rows)
-    assert "commodity_psyllium_husk" in X_new.columns
+def test_booking_after_market_history_is_refused(dataset, state):
+    shipments, market = dataset
+    row = shipments.iloc[[0]].copy()
+    row["booking_date"] = market["date"].max() + pd.Timedelta(days=MAX_MARKET_STALENESS_DAYS + 1)
+    with pytest.raises(MarketDataError, match="refresh the market data"):
+        build_features(row, state)
+
+
+def test_booking_before_usable_history_is_refused(dataset, state):
+    shipments, market = dataset
+    row = shipments.iloc[[0]].copy()
+    row["booking_date"] = market["date"].min() + pd.Timedelta(days=10)
+    with pytest.raises(MarketDataError, match="before usable market history"):
+        build_features(row, state)
